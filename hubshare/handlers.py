@@ -10,7 +10,7 @@ class BaseHandler(HubAuthenticated, JupyterHubBaseHandler):
     """A hubshare base handler"""
 
     # register URL patterns
-    urls = []
+    urls = ['']
 
     @property
     def hub_auth(self):
