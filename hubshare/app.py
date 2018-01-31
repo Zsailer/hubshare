@@ -205,13 +205,25 @@ class HubShare(Application):
         help=_('The notebook manager class to use.')
     )
 
+    # Root directory of hubshare application
+    root_dir = Unicode('hubshare').tag(config=True)
+
+    @default('root_dir')
+    def _root_dir_default(self):
+        return 'hubshare'
+
     def init_manager(self):
         """Initialize cotents managaer"""
-        self.hubshare_manager = self.hubshare_manager_class(
+        self.contents_manager = self.hubshare_manager_class(
             parent=self,
             log=self.log,
         )
-        self.tornado_settings.update(hubshare_manager=self.hubshare_manager)
+
+        # Define the hubshare directory.
+        self.contents_manager.root_dir = self.root_dir
+
+        # Add contents_manager to hubshare application.
+        self.tornado_settings.update(contents_manager=self.contents_manager)
 
     def init_handlers(self):
         """Load hubshare's tornado request handlers"""
