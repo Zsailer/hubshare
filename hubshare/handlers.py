@@ -12,10 +12,30 @@ class BaseHandler(HubAuthenticated, JupyterHubBaseHandler):
     # register URL patterns
     urls = []
 
+    # The next two methods exist to circumvent the basehandler's async 
+    # versions of the methods.
+    def prepare(self):
+        """"""
+        try:
+            self.get_current_user()
+        except Exception:
+            self.log.exception("Failed to get current user")
+            self._hub_auth_user_cache = None
+
+    @property
+    def current_user(self):
+        """Override .current_user accessor from tornado."""
+        if not hasattr(self, '_hub_auth_user_cache'):
+            raise RuntimeError("No user found.")
+        return self._hub_auth_user_cache
+
     @property
     def hub_auth(self):
         return self.settings.get('hub_auth')
 
+    @property
+    def contents(self):
+        return self.settings.get('contents_manager')
 
     @property
     def csp_report_uri(self):
@@ -53,7 +73,9 @@ class RootHandler(BaseHandler):
 
     @web.authenticated
     def get(self):
-        self.render_template('index.html')
+        template = self.render_template('index.html')
+        self.write(template)
+
 
 # The exported handlers
 default_handlers = [

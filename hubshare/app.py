@@ -16,7 +16,7 @@ from tornado.log import app_log, access_log, gen_log
 from tornado.ioloop import IOLoop
 from tornado import web
 
-from traitlets.config import Application, catch_config_error
+from traitlets.config import catch_config_error
 from traitlets import (
     Bool, Dict, Integer, List, Unicode,
     default,
@@ -27,10 +27,18 @@ from jupyterhub.services.auth import HubAuth
 from jupyterhub.utils import url_path_join
 
 from . import handlers, apihandlers
+from .manager import HubShareManager
+
+from jupyter_core.application import JupyterApp
+from jupyter_server.serverapp import (
+    load_handlers,
+    ServerWebApplication,
+    ServerApp
+)
 
 ROOT = os.path.dirname(__file__)
-STATIC_FILES_DIR = os.path.join(ROOT, 'static')
-TEMPLATES_DIR = os.path.join(ROOT, 'templates')
+DEFAULT_STATIC_FILES_PATH = os.path.join(ROOT, 'static')
+DEFAULT_TEMPLATE_PATH_LIST = [os.path.join(ROOT, 'templates')]
 
 class UnicodeFromEnv(Unicode):
     """A Unicode trait that gets its default value from the environment
@@ -44,7 +52,8 @@ class UnicodeFromEnv(Unicode):
         else:
             return self.default_value
 
-class HubShare(Application):
+
+class HubShare(ServerApp):
     """The HubShare application"""
     @property
     def version(self):
@@ -74,7 +83,12 @@ class HubShare(Application):
         config=True,
     )
 
+    classes = List([
+        HubShareManager
+    ])
+
     ip = Unicode('127.0.0.1').tag(config=True)
+
     @default('ip')
     def _ip_default(self):
         url_s = os.environ.get('JUPYTERHUB_SERVICE_URL')
@@ -84,6 +98,7 @@ class HubShare(Application):
         return url.hostname
 
     port = Integer(9090).tag(config=True)
+
     @default('port')
     def _port_default(self):
         url_s = os.environ.get('JUPYTERHUB_SERVICE_URL')
@@ -92,134 +107,71 @@ class HubShare(Application):
         url = urlparse(url_s)
         return url.port
 
-    template_paths = List(
-        help="Paths to search for jinja templates.",
-    ).tag(config=True)
-    @default('template_paths')
-    def _template_paths_default(self):
-        return [TEMPLATES_DIR]
+    @property
+    def static_file_path(self):
+        """return extra paths + the default location"""
+        return self.extra_static_paths + [DEFAULT_STATIC_FILES_PATH]
 
-    tornado_settings = Dict()
-
-    _log_formatter_cls = CoroutineLogFormatter
-
-    @default('log_level')
-    def _log_level_default(self):
-        return logging.INFO
-
-    @default('log_datefmt')
-    def _log_datefmt_default(self):
-        """Exclude date from default date format"""
-        return "%Y-%m-%d %H:%M:%S"
-
-    @default('log_format')
-    def _log_format_default(self):
-        """override default log format to include time"""
-        return "%(color)s[%(levelname)1.1s %(asctime)s.%(msecs).03d %(name)s %(module)s:%(lineno)d]%(end_color)s %(message)s"
-
-    def init_logging(self):
-        """Initialize logging"""
-        # This prevents double log messages because tornado use a root logger that
-        # self.log is a child of. The logging module dipatches log messages to a log
-        # and all of its ancenstors until propagate is set to False.
-        self.log.propagate = False
-
-        _formatter = self._log_formatter_cls(
-            fmt=self.log_format,
-            datefmt=self.log_datefmt,
-        )
-
-        # hook up tornado 3's loggers to our app handlers
-        for log in (app_log, access_log, gen_log):
-            # ensure all log statements identify the application they come from
-            log.name = self.log.name
-        logger = logging.getLogger('tornado')
-        logger.propagate = True
-        logger.parent = self.log
-        logger.setLevel(self.log.level)
+    @property
+    def template_file_path(self):
+        """return extra paths + the default locations"""
+        return self.extra_template_paths + DEFAULT_TEMPLATE_PATH_LIST
 
     def init_db(self):
         """Initialize the HubShare database"""
         self.db = None
+        self.tornado_settings["db"] = self.db
 
     def init_hub_auth(self):
         """Initialize hub authentication"""
-        self.hub_auth = HubAuth()
+        self.hub_auth = HubAuth(api_token=self.token)
+        self.tornado_settings["hub_auth"] = self.hub_auth
 
-    def init_tornado_settings(self):
-        """Initialize tornado config"""
-        jinja_options = dict(
-            autoescape=True,
+    def init_extra_settings(self):
+        self.tornado_settings["logout_url"] = url_path_join(
+            self.hub_base_url, 'hub/logout')
+        self.tornado_settings['contents_manager'] = HubShareManager(
+            parent=self,
+            log=self.log
         )
-        jinja_env = Environment(
-            loader=FileSystemLoader(self.template_paths),
-            **jinja_options
-        )
 
-        # if running from git directory, disable caching of require.js
-        # otherwise cache based on server start time
-        parent = os.path.dirname(ROOT)
-        if os.path.isdir(os.path.join(parent, '.git')):
-            version_hash = ''
-        else:
-            version_hash=datetime.now().strftime("%Y%m%d%H%M%S"),
-
-        settings = dict(
-            log_function=log_request,
-            config=self.config,
-            log=self.log,
-            base_url=self.base_url,
-            hub_auth = self.hub_auth,
-            login_url=self.hub_auth.login_url,
-            hub_base_url = self.hub_base_url,
-            logout_url=url_path_join(self.hub_base_url, 'hub/logout'),
-            static_path=STATIC_FILES_DIR,
-            static_url_prefix=url_path_join(self.base_url, 'static/'),
-            template_path=self.template_paths,
-            jinja2_env=jinja_env,
-            version_hash=version_hash,
-            xsrf_cookies=True,
-        )
-        # allow configured settings to have priority
-        settings.update(self.tornado_settings)
-        self.tornado_settings = settings
-
-    def init_handlers(self):
+    def init_hubshare_handlers(self):
         """Load hubshare's tornado request handlers"""
-        self.handlers = []
+        handlers_ = [] 
         for handler in handlers.default_handlers + apihandlers.default_handlers:
             for url in handler.urls:
-                self.handlers.append((url_path_join(self.base_url, url), handler))
-        self.handlers.append((r'.*', handlers.Template404))
-
-    def init_tornado_application(self):
-        self.tornado_application = web.Application(self.handlers, **self.tornado_settings)
+                handlers_.append((url_path_join(self.base_url, url), handler))
+        handlers_.append((r'.*', handlers.Template404))
+        self.web_app.add_handlers('.*$', handlers_)
 
     @catch_config_error
-    def initialize(self, *args, **kwargs):
-        super().initialize(*args, **kwargs)
-        if self.generate_config or self.subapp:
+    def initialize(self, argv=None):
+        # This method hopefully won't be needed is jupyter_server is completely 
+        # configurable and granular
+
+        # Prevent the browser from opening.
+        self.open_browser = False
+        self._token_generated = False
+
+        # Parse command line using JupyterApp... 
+        # Shouldn't need this after jupyter_server 
+        # moves forward.
+        JupyterApp.initialize(self, argv=argv)
+        self.init_logging()
+        if self._dispatching:
             return
+        self.init_configurables()
+        self.init_components()
+
+        # Specific to HubShare
         self.init_db()
         self.init_hub_auth()
-        self.init_tornado_settings()
-        self.init_handlers()
-        self.init_tornado_application()
+        self.init_extra_settings()
 
-    def start(self):
-        if self.subapp:
-            self.subapp.start()
-            return
+        # Init webapp.
+        self.init_webapp()
+        self.init_hubshare_handlers()
 
-        if self.generate_config:
-            self.write_config_file()
-            return
-
-        self.http_server = HTTPServer(self.tornado_application, xheaders=True)
-        self.http_server.listen(self.port, address=self.ip)
-
-        self.log.info("Running HubShare at http://%s:%i%s", self.ip, self.port, self.base_url)
-        IOLoop.current().start()
 
 main = HubShare.launch_instance
 
