@@ -8,14 +8,11 @@ from jupyterhub.utils import url_path_join
 
 class BaseHandler(HubAuthenticated, JupyterHubBaseHandler):
     """A hubshare base handler"""
-
-    # register URL patterns
-    urls = []
+    hub_users = {'zsailer'}
 
     @property
     def hub_auth(self):
         return self.settings.get('hub_auth')
-
 
     @property
     def csp_report_uri(self):
@@ -36,12 +33,11 @@ class BaseHandler(HubAuthenticated, JupyterHubBaseHandler):
         )
 
     def finish(self):
-        return super(JupyterHubBaseHandler, self).finish()
+        return super(BaseHandler, self).finish()
 
 
 class Template404(BaseHandler):
     """Render hubshare's 404 template"""
-    urls = ['.*']
 
     def prepare(self):
         raise web.HTTPError(404)
@@ -49,13 +45,16 @@ class Template404(BaseHandler):
 
 class RootHandler(BaseHandler):
     """Handler for serving hubshare's human facing pages"""
-    urls = ['/']
+    def get(self):
+        self.render_template('index.html')
 
-    @web.authenticated
+class NoSlashHandler(BaseHandler):
     def get(self):
         self.render_template('index.html')
 
 # The exported handlers
 default_handlers = [
-    RootHandler,
+    (r'', NoSlashHandler),
+    (r'/', RootHandler),
+    (r'.*', Template404)
 ]

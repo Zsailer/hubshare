@@ -26,23 +26,39 @@ from jupyterhub.log import CoroutineLogFormatter, log_request
 from jupyterhub.services.auth import HubAuth
 from jupyterhub.utils import url_path_join
 
-from . import handlers, apihandlers
+
+# Import storage API
+from .webdav.app import init_storage_app
+
 
 ROOT = os.path.dirname(__file__)
 STATIC_FILES_DIR = os.path.join(ROOT, 'static')
 TEMPLATES_DIR = os.path.join(ROOT, 'templates')
 
-class UnicodeFromEnv(Unicode):
-    """A Unicode trait that gets its default value from the environment
 
-    Use .tag(env='VARNAME') to specify the environment variable to use.
-    """
-    def default(self, obj=None):
-        env_key = self.metadata.get('env')
-        if env_key in os.environ:
-            return os.environ[env_key]
-        else:
-            return self.default_value
+def load_handlers(name):
+    """Load the (URL pattern, handler) tuples for each component."""
+    mod = __import__(name, fromlist=['default_handlers'])
+    return mod.default_handlers
+
+# Waiting for traitlets 5.0
+# class UnicodeFromEnv(Unicode):
+#     """A Unicode trait that gets its default value from the environment
+
+#     Use .tag(env='VARNAME') to specify the environment variable to use.
+#     """
+#     def default(self, obj=None):
+#         env_key = self.metadata.get('env')
+#         if env_key in os.environ:
+#             return os.environ[env_key]
+#         else:
+#             return self.default_value
+
+def get_environ(env_key, default):
+    if env_key in os.environ:
+        return os.environ[env_key]
+    else:
+        return default
 
 class HubShare(Application):
     """The HubShare application"""
@@ -52,27 +68,50 @@ class HubShare(Application):
         return pkg_resources.get_distribution('hubshare').version
 
     description = __doc__
+
     config_file = Unicode('hubshare_config.py',
         help="The config file to load",
     ).tag(config=True)
+
     generate_config = Bool(False,
         help="Generate default config file",
     ).tag(config=True)
 
-    base_url = UnicodeFromEnv('/services/hubshare/').tag(
-        env='JUPYTERHUB_SERVICE_PREFIX',
-        config=True)
-    hub_api_url = UnicodeFromEnv('http://127.0.0.1:8081/hub/api/').tag(
-        env='JUPYTERHUB_API_URL',
-        config=True)
-    hub_api_token = UnicodeFromEnv('').tag(
-        env='JUPYTERHUB_API_TOKEN',
-        config=True,
-    )
-    hub_base_url = UnicodeFromEnv('http://127.0.0.1:8000/').tag(
-        env='JUPYTERHUB_BASE_URL',
-        config=True,
-    )
+    base_url = Unicode(config=True)
+
+    @default('base_url')
+    def _base_url_default(self):
+        return get_environ(
+            'JUPYTERHUB_SERVICE_PREFIX',
+            '/services/hubshare/'
+        )
+
+    hub_api_url = Unicode(config=True)
+
+    @default('hub_api_url')
+    def _hub_api_url_default(self):
+        return get_environ(
+            'JUPYTERHUB_API_URL',
+            'http://127.0.0.1:8081/hub/api/',
+        )
+
+    hub_api_token = Unicode(config=True)
+
+    @default('hub_api_token')
+    def _hub_api_token_default(self):
+        return get_environ(
+            'JUPYTERHUB_API_TOKEN',
+            ''
+        )
+
+    hub_base_url = Unicode(config=True)
+
+    @default('hub_base_url')
+    def _hub_base_url_default(self):
+        return get_environ(
+            'JUPYTERHUB_BASE_URL',
+            'http://127.0.0.1:8000/'
+        )
 
     ip = Unicode('127.0.0.1').tag(config=True)
     @default('ip')
@@ -138,13 +177,13 @@ class HubShare(Application):
         logger.parent = self.log
         logger.setLevel(self.log.level)
 
-    def init_db(self):
+    def init_storage_app(self):
         """Initialize the HubShare database"""
-        self.db = None
+        self.storage_app = init_storage_app()
 
-    def init_hub_auth(self):
-        """Initialize hub authentication"""
-        self.hub_auth = HubAuth()
+    # def init_hub_auth(self):
+    #     """Initialize hub authentication"""
+    #     self.hub_auth = HubAuth()
 
     def init_tornado_settings(self):
         """Initialize tornado config"""
@@ -169,8 +208,9 @@ class HubShare(Application):
             config=self.config,
             log=self.log,
             base_url=self.base_url,
-            hub_auth = self.hub_auth,
-            login_url=self.hub_auth.login_url,
+            db=None,
+            #hub_auth = self.hub_auth,
+            #login_url=self.hub_auth.login_url,
             hub_base_url = self.hub_base_url,
             logout_url=url_path_join(self.hub_base_url, 'hub/logout'),
             static_path=STATIC_FILES_DIR,
@@ -179,6 +219,7 @@ class HubShare(Application):
             jinja2_env=jinja_env,
             version_hash=version_hash,
             xsrf_cookies=True,
+            storage_app=self.storage_app
         )
         # allow configured settings to have priority
         settings.update(self.tornado_settings)
@@ -186,11 +227,12 @@ class HubShare(Application):
 
     def init_handlers(self):
         """Load hubshare's tornado request handlers"""
-        self.handlers = []
-        for handler in handlers.default_handlers + apihandlers.default_handlers:
-            for url in handler.urls:
-                self.handlers.append((url_path_join(self.base_url, url), handler))
-        self.handlers.append((r'.*', handlers.Template404))
+        handlers = []
+        handlers.extend(load_handlers('hubshare.webdav.handlers'))
+        handlers.extend(load_handlers('hubshare.webdav.apihandlers'))
+        #handlers.extend(load_handlers('hubshare.handlers'))
+        self.handlers = [(url_path_join(self.base_url, url), handler)
+                        for url, handler in handlers]
 
     def init_tornado_application(self):
         self.tornado_application = web.Application(self.handlers, **self.tornado_settings)
@@ -200,8 +242,8 @@ class HubShare(Application):
         super().initialize(*args, **kwargs)
         if self.generate_config or self.subapp:
             return
-        self.init_db()
-        self.init_hub_auth()
+        self.init_storage_app()
+        #self.init_hub_auth()
         self.init_tornado_settings()
         self.init_handlers()
         self.init_tornado_application()
