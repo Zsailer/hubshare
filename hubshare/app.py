@@ -14,7 +14,7 @@ from jinja2 import Environment, FileSystemLoader
 from tornado.httpserver import HTTPServer
 from tornado.log import app_log, access_log, gen_log
 from tornado.ioloop import IOLoop
-from tornado import web
+from tornado import web, wsgi
 
 from traitlets.config import Application, catch_config_error
 from traitlets import (
@@ -27,6 +27,9 @@ from jupyterhub.services.auth import HubAuth
 from jupyterhub.utils import url_path_join
 
 from . import handlers, apihandlers
+
+from wsgidav.wsgidav_app import WsgiDAVApp
+
 
 ROOT = os.path.dirname(__file__)
 STATIC_FILES_DIR = os.path.join(ROOT, 'static')
@@ -95,9 +98,19 @@ class HubShare(Application):
     template_paths = List(
         help="Paths to search for jinja templates.",
     ).tag(config=True)
+
     @default('template_paths')
     def _template_paths_default(self):
         return [TEMPLATES_DIR]
+
+    storage_path = Unicode(
+        help="Path to hubshare storage directory."
+    ).tag(config=True)
+
+    @default('storage_path')
+    def _storage_path_default(self):
+        cwd = os.getcwd()
+        return os.path.join(cwd, 'hubshare')
 
     tornado_settings = Dict()
 
@@ -144,7 +157,26 @@ class HubShare(Application):
 
     def init_hub_auth(self):
         """Initialize hub authentication"""
-        self.hub_auth = HubAuth()
+        self.hub_auth = HubAuth(
+            api_token=self.hub_api_token
+        )
+
+    def init_webdav(self):
+        # setup basic WSGI DAV application configuration
+        host_url = 'http://{}:{}'.format(self.ip, self.port)
+        self.webdav_url = url_path_join(self.base_url, 'dav')
+        config = {
+            "host": self.ip,
+            "port": self.port,
+            "provider_mapping": {"/services/hubshare/dav": self.storage_path},
+            "verbose": 1,
+            "simple_dc": {"user_mapping":{"*": True}} 
+        }
+        app =  WsgiDAVApp(config)
+        self.webdav_app = wsgi.WSGIContainer(app)
+        # Define the url webdav server will live.
+        # Setup up webdav client interface.
+        host = url_path_join(host_url, self.webdav_url)
 
     def init_tornado_settings(self):
         """Initialize tornado config"""
@@ -179,6 +211,7 @@ class HubShare(Application):
             jinja2_env=jinja_env,
             version_hash=version_hash,
             xsrf_cookies=True,
+            webdav_app=self.webdav_app,
         )
         # allow configured settings to have priority
         settings.update(self.tornado_settings)
@@ -190,6 +223,14 @@ class HubShare(Application):
         for handler in handlers.default_handlers + apihandlers.default_handlers:
             for url in handler.urls:
                 self.handlers.append((url_path_join(self.base_url, url), handler))
+        # Attach webdav handlers.
+        self.handlers.append(
+            (
+                self.webdav_url + '/.*', 
+                handlers.WebDavHandler, 
+                {'fallback':self.webdav_app}
+            )
+        )
         self.handlers.append((r'.*', handlers.Template404))
 
     def init_tornado_application(self):
@@ -200,8 +241,10 @@ class HubShare(Application):
         super().initialize(*args, **kwargs)
         if self.generate_config or self.subapp:
             return
+        self.load_config_file(self.config_file)
         self.init_db()
         self.init_hub_auth()
+        self.init_webdav()
         self.init_tornado_settings()
         self.init_handlers()
         self.init_tornado_application()
